@@ -1,0 +1,56 @@
+export const dynamic = "force-dynamic"
+import { NextRequest, NextResponse } from 'next/server'
+
+import { getOrchestratorClient } from '@/lib/orchestrator/client'
+import { orchestratorPath } from '@/lib/orchestrator/path'
+import { verifyConnectionOwnership } from '@/lib/tenant'
+import { checkPermission, PERMISSIONS } from '@/lib/rbac'
+import { withPublicApiGuard } from '@/lib/api-tokens/routeGuard'
+import { getConnectionById } from '@/lib/connections/getConnection'
+import { orchestratorOrPve } from '@/lib/firewall/withPveFallback'
+import * as pveDirect from '@/lib/firewall/pveDirect'
+import { guardSessionGuest } from '@/lib/vdc/guestGuard'
+import { withAudit } from '@/lib/audit/withAudit'
+import { noteGuestNicFirewall, peekGuestNet } from '@/lib/inventory/guestDiskTotals'
+import { forgetGuestCoverage } from '@/lib/firewall/guestCoverage'
+
+type RouteContext = {
+  params: Promise<{ connectionId: string; node: string; vmType: string; vmid: string }>
+}
+
+// PUT - Toggle firewall on all NICs of a VM/CT
+async function putHandler(req: NextRequest, ctx: RouteContext) {
+  try {
+    const { connectionId, node, vmType, vmid } = await ctx.params
+    const ownershipDenied = await verifyConnectionOwnership(connectionId)
+    if (ownershipDenied) return ownershipDenied
+
+    const denied = await checkPermission(PERMISSIONS.NODE_MANAGE, "connection", connectionId)
+    if (denied) return denied
+
+    const scopeDenied = await guardSessionGuest({ connectionId, conn: () => getConnectionById(connectionId), type: vmType, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    const body = await req.json()
+
+    const orchestrator = getOrchestratorClient()
+
+    const result = await orchestratorOrPve(
+      'firewall/vms/nic-firewall',
+      () => orchestrator.put(orchestratorPath`/firewall/vms/${connectionId}/${node}/${vmType}/${vmid}/nic-firewall`, body),
+      // Second level of the guest firewall: rewrites firewall=0/1 on every NIC
+      async () => pveDirect.toggleVMNICFirewall(await getConnectionById(connectionId), node, vmType, vmid, body.enable),
+    )
+    // The cached NIC flag follows the toggle; the coverage reads it on every answer, nothing to forget (UA44). Only a
+    // guest whose config is not in that cache (the coverage then keeps what it read itself) is read again (UA46).
+    noteGuestNicFirewall(connectionId, vmType, vmid, !!body.enable)
+    if (peekGuestNet(connectionId, vmType, vmid) === undefined) forgetGuestCoverage(connectionId, { type: vmType, vmid })
+
+    return NextResponse.json(result)
+  } catch (e: any) {
+    console.error("[firewall/vms/nic-firewall] PUT error:", e)
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const PUT = withAudit({ category: 'firewall', resourceType: 'guest', resourceParam: 'vmid', resourceTypeParam: 'vmType' }, withPublicApiGuard("fw-vm-nic-firewall-update", putHandler))

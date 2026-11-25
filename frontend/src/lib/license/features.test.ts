@@ -1,0 +1,150 @@
+import { describe, it, expect } from 'vitest'
+import {
+  Features,
+  EDITION_FEATURES,
+  effectiveHasFeature,
+  isEnterpriseEdition,
+  optionDisplayName,
+  OPTION_REGISTRY,
+} from './features'
+
+const enterprise = { licensed: true, expired: false, edition: 'enterprise' }
+
+describe('effectiveHasFeature', () => {
+  it('grants an edition feature to a licensed enterprise', () => {
+    expect(effectiveHasFeature(enterprise, Features.DRS)).toBe(true)
+  })
+  it('denies HA without the option, even on enterprise', () => {
+    expect(effectiveHasFeature(enterprise, Features.HA)).toBe(false)
+  })
+  it('grants HA via options on enterprise', () => {
+    expect(effectiveHasFeature({ ...enterprise, options: ['control_plane_ha'] }, Features.HA)).toBe(true)
+  })
+  it('grants HA via options on enterprise_plus', () => {
+    expect(
+      effectiveHasFeature(
+        { licensed: true, expired: false, edition: 'enterprise_plus', options: ['control_plane_ha'] },
+        Features.HA,
+      ),
+    ).toBe(true)
+  })
+  it('denies options on a non-enterprise edition (defense in depth)', () => {
+    expect(
+      effectiveHasFeature(
+        { licensed: true, expired: false, edition: 'community', options: ['control_plane_ha'] },
+        Features.HA,
+      ),
+    ).toBe(false)
+  })
+  it('denies everything when expired', () => {
+    expect(effectiveHasFeature({ ...enterprise, expired: true, options: ['control_plane_ha'] }, Features.HA)).toBe(false)
+    expect(effectiveHasFeature({ ...enterprise, expired: true }, Features.DRS)).toBe(false)
+  })
+  it('denies everything when unlicensed, null or empty', () => {
+    expect(effectiveHasFeature(null, Features.DRS)).toBe(false)
+    expect(effectiveHasFeature(undefined, Features.HA)).toBe(false)
+    expect(effectiveHasFeature({}, Features.DRS)).toBe(false)
+    expect(effectiveHasFeature({ licensed: false, edition: 'enterprise', options: ['control_plane_ha'] }, Features.HA)).toBe(false)
+  })
+  // Local build override (AGPL-3.0 modification of the Community Edition
+  // source): OIDC SSO, RBAC user management (with multi-tenancy), LDAP/AD,
+  // the API Access add-on, Syslog forwarding and control-plane HA are
+  // force-granted regardless of the license verdict, community included and
+  // even with no license status at all.
+  it('force-grants OIDC, RBAC, multi-tenancy, LDAP, API access, syslog and HA regardless of the license verdict', () => {
+    for (const id of [Features.OIDC, Features.RBAC, Features.MULTI_TENANCY, Features.LDAP, Features.API_ACCESS, Features.SYSLOG_FORWARDING, Features.HA]) {
+      expect(effectiveHasFeature(null, id), `${id} forced with null status`).toBe(true)
+      expect(effectiveHasFeature(undefined, id), `${id} forced with undefined status`).toBe(true)
+      expect(effectiveHasFeature({}, id), `${id} forced with an empty status`).toBe(true)
+      expect(
+        effectiveHasFeature({ licensed: false, expired: false, edition: 'community' }, id),
+        `${id} forced on an unlicensed community`,
+      ).toBe(true)
+      expect(
+        effectiveHasFeature({ licensed: true, expired: true, edition: 'enterprise' }, id),
+        `${id} forced even when expired`,
+      ).toBe(true)
+    }
+  })
+  it('keeps every other feature fail-closed on community', () => {
+    const community = { licensed: false, expired: false, edition: 'community' }
+    expect(effectiveHasFeature(community, Features.DRS)).toBe(false)
+    expect(effectiveHasFeature(community, Features.AI_INSIGHTS)).toBe(false)
+    expect(effectiveHasFeature(community, 'white_label')).toBe(false)
+    expect(effectiveHasFeature(community, 'sla_monitoring')).toBe(false)
+  })
+})
+
+describe('registry and edition mapping invariants', () => {
+  it('HA is the control_plane_ha option capability', () => {
+    expect(Features.HA).toBe('control_plane_ha')
+  })
+  it('HA belongs to NO edition feature list', () => {
+    for (const [edition, list] of Object.entries(EDITION_FEATURES)) {
+      expect(list.includes(Features.HA), `HA leaked into ${edition}`).toBe(false)
+    }
+  })
+  // enterprise_plus is the higher tier, so it can add features but must never
+  // drop one. `white_label` was missing from it while present in `enterprise`,
+  // and effectiveHasFeature has no inheritance between editions, so paying more
+  // silently removed white labeling, and with it any hope of branded reports.
+  it('enterprise_plus is a superset of enterprise', () => {
+    const missing = EDITION_FEATURES.enterprise.filter(f => !EDITION_FEATURES.enterprise_plus.includes(f))
+
+    expect(missing, `enterprise_plus is missing ${missing.join(', ')}`).toEqual([])
+  })
+
+  it('grants white labeling on both enterprise tiers without an option', () => {
+    for (const edition of ['enterprise', 'enterprise_plus']) {
+      expect(
+        effectiveHasFeature({ licensed: true, edition }, 'white_label'),
+        `white_label denied on ${edition}`,
+      ).toBe(true)
+    }
+
+    expect(effectiveHasFeature({ licensed: true, edition: 'community' }, 'white_label')).toBe(false)
+  })
+
+  it('isEnterpriseEdition matches both enterprise tiers only', () => {
+    expect(isEnterpriseEdition('enterprise')).toBe(true)
+    expect(isEnterpriseEdition('enterprise_plus')).toBe(true)
+    expect(isEnterpriseEdition('community')).toBe(false)
+    expect(isEnterpriseEdition(undefined)).toBe(false)
+  })
+  it('every registered option has display info; unknown ids fall back to the raw id', () => {
+    expect(OPTION_REGISTRY.control_plane_ha.name).toBe('ProxCenter HA')
+    expect(optionDisplayName('control_plane_ha')).toBe('ProxCenter HA')
+    expect(optionDisplayName('mystery_cap')).toBe('mystery_cap')
+  })
+  it('describes the API Access option as covering reads and writes', () => {
+    const { description } = OPTION_REGISTRY.api_access
+    expect(description).toMatch(/read and write/i)
+    expect(description).not.toMatch(/read-only/i)
+  })
+
+  it('grants incidents to both enterprise tiers and not to community', () => {
+    expect(Features.INCIDENTS).toBe('incidents')
+    expect(EDITION_FEATURES.enterprise).toContain('incidents')
+    expect(EDITION_FEATURES.enterprise_plus).toContain('incidents')
+    expect(EDITION_FEATURES.community ?? []).not.toContain('incidents')
+    expect(effectiveHasFeature(enterprise, 'incidents')).toBe(true)
+    expect(effectiveHasFeature({ licensed: true, edition: 'community' }, 'incidents')).toBe(false)
+  })
+
+  it('grants SLA monitoring to both enterprise tiers and not to community', () => {
+    expect(Features.SLA_MONITORING).toBe('sla_monitoring')
+    expect(EDITION_FEATURES.enterprise).toContain('sla_monitoring')
+    expect(EDITION_FEATURES.enterprise_plus).toContain('sla_monitoring')
+    expect(EDITION_FEATURES.community ?? []).not.toContain('sla_monitoring')
+    expect(effectiveHasFeature({ licensed: true, edition: 'community' }, 'sla_monitoring')).toBe(false)
+    expect(effectiveHasFeature(enterprise, 'sla_monitoring')).toBe(true)
+  })
+
+  it('grants the GPU page to both enterprise tiers and not to community', () => {
+    expect(Features.GPU_MANAGEMENT).toBe('gpu_management')
+    expect(EDITION_FEATURES.enterprise).toContain('gpu_management')
+    expect(EDITION_FEATURES.enterprise_plus).toContain('gpu_management')
+    expect(effectiveHasFeature({ licensed: true, edition: 'community' }, 'gpu_management')).toBe(false)
+    expect(effectiveHasFeature(enterprise, 'gpu_management')).toBe(true)
+  })
+})
