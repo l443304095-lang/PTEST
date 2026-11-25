@@ -1,0 +1,87 @@
+export const dynamic = "force-dynamic"
+// src/app/api/v1/firewall/groups/[connectionId]/route.ts
+import { NextRequest, NextResponse } from 'next/server'
+
+import { getOrchestratorClient } from '@/lib/orchestrator/client'
+import { orchestratorPath } from '@/lib/orchestrator/path'
+import { getConnectionById } from '@/lib/connections/getConnection'
+import * as pveDirect from '@/lib/firewall/pveDirect'
+import { orchestratorOrPve } from '@/lib/firewall/withPveFallback'
+import { verifyConnectionOwnership } from '@/lib/tenant'
+import { resolveCallerInfraScope } from '@/lib/tenant/iaasGuard'
+import { iaasFirewallNamesView } from '@/lib/connections/iaasView'
+import { checkPermission, PERMISSIONS } from '@/lib/rbac'
+import { withPublicApiGuard } from '@/lib/api-tokens/routeGuard'
+import { withAudit } from '@/lib/audit/withAudit'
+import { guardProviderInfra } from '@/lib/firewall/providerInfraGuard'
+
+// GET /api/v1/firewall/groups/[connectionId] - Get all security groups
+async function getHandler(
+  request: NextRequest,
+  { params }: { params: Promise<{ connectionId: string }> }
+) {
+  try {
+    const { connectionId } = await params
+    // An IaaS tenant picks these by name in its guests' firewall rules and
+    // reads nothing else of the provider's datacenter firewall (lib/connections/iaasView).
+    const caller = await resolveCallerInfraScope()
+    if (caller.ok === false) return caller.response
+
+    const ownershipDenied = await verifyConnectionOwnership(connectionId)
+    if (ownershipDenied) return ownershipDenied
+
+    const denied = await checkPermission(PERMISSIONS.NODE_VIEW, "connection", connectionId)
+    if (denied) return denied
+
+    const orchestrator = getOrchestratorClient()
+    // Community has no orchestrator: read the groups straight from PVE (#616).
+    // The connection is only loaded on that fallback path.
+    const groups = await orchestratorOrPve(
+      'firewall/groups',
+      () => orchestrator.get(orchestratorPath`/firewall/groups/${connectionId}`),
+      async () => pveDirect.getSecurityGroups(await getConnectionById(connectionId)),
+    )
+
+    return NextResponse.json(caller.infra.kind === 'iaas' ? iaasFirewallNamesView(groups, 'group') : groups)
+  } catch (error: any) {
+    console.error('Error fetching security groups:', error)
+    
+return NextResponse.json(
+      { error: error.message || 'Failed to fetch security groups' },
+      { status: 500 }
+    )
+  }
+}
+
+// POST /api/v1/firewall/groups/[connectionId] - Create security group
+async function postHandler(
+  request: NextRequest,
+  { params }: { params: Promise<{ connectionId: string }> }
+) {
+  try {
+    const { connectionId } = await params
+    const denied = await guardProviderInfra(connectionId, PERMISSIONS.NODE_MANAGE)
+    if (denied) return denied
+
+    const body = await request.json()
+
+    const orchestrator = getOrchestratorClient()
+    const created = await orchestratorOrPve(
+      'firewall/groups',
+      () => orchestrator.post(orchestratorPath`/firewall/groups/${connectionId}`, body),
+      async () => pveDirect.createSecurityGroup(await getConnectionById(connectionId), body),
+    )
+
+    return NextResponse.json(created, { status: 201 })
+  } catch (error: any) {
+    console.error('Error creating security group:', error)
+    
+return NextResponse.json(
+      { error: error.message || 'Failed to create security group' },
+      { status: 500 }
+    )
+  }
+}
+
+export const GET = withPublicApiGuard("fw-groups-list", getHandler)
+export const POST = withAudit({ category: 'firewall', resourceType: 'group', resourceParam: 'connectionId' }, withPublicApiGuard("fw-group-create", postHandler))

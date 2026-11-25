@@ -1,0 +1,250 @@
+import { NextResponse, after } from "next/server"
+import { licenseExcludedResponse } from "@/lib/api/response"
+
+import { pveFetch } from "@/lib/proxmox/client"
+import { getConnectionById } from "@/lib/connections/getConnection"
+import { checkPermission, buildVmResourceId, PERMISSIONS } from "@/lib/rbac"
+import { getCurrentTenantId, DEFAULT_TENANT_ID } from "@/lib/tenant"
+import { getTenantInfrastructureScope } from "@/lib/tenant/infraScope"
+import { getAllowedNetworksForTenant, validateNetAgainstScope } from "@/lib/vdc/vnets"
+import { waitForTask } from "@/lib/proxmox/tasks"
+import { restampGuestDrives } from "@/lib/vdc/driveGuard"
+import type { DriveQosCaps } from "@/lib/vdc/drives"
+import { guardSessionGuest, parseGuestKey, type GuestTarget } from "@/lib/vdc/guestGuard"
+import { safeLog } from "@/lib/log/sanitize"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
+import { withAudit } from "@/lib/audit/withAudit"
+
+export const runtime = "nodejs"
+
+type Params = {
+  vmid: string // Format: connId:type:node:vmid
+  snapname: string
+}
+
+// Same grammar as the creation route accepts, so the segment is a snapshot name.
+const SNAPNAME_RE = /^[a-zA-Z0-9_-]+$/
+
+/** Every segment of the PVE snapshot path is encoded, so no identifier can reshape the URL. */
+function snapshotPath({ type, node, vmid }: GuestTarget, snapname: string, suffix: string) {
+  return `/nodes/${encodeURIComponent(node)}/${encodeURIComponent(type)}/${encodeURIComponent(vmid)}/snapshot/${encodeURIComponent(snapname)}/${suffix}`
+}
+
+async function getConnection(id: string) {
+  // Use the shared helper so vDC tenants reach provider-owned connections
+  // through their vDC scope instead of getting a tenant-scoped 404.
+  try {
+    return await getConnectionById(id)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * POST /api/v1/guests/[vmid]/snapshots/[snapname]
+ * Rollback vers un snapshot
+ */
+async function postHandler(
+  req: Request,
+  ctx: { params: Promise<Params> }
+) {
+  try {
+    const params = await ctx.params
+    const key = parseGuestKey(params.vmid)
+    if (!key.ok) return key.response
+    const { connId, type, node, vmid } = key
+    const snapname = params.snapname
+    if (!SNAPNAME_RE.test(snapname)) {
+      return NextResponse.json({ error: "Invalid snapshot name" }, { status: 400 })
+    }
+
+    // RBAC: Check vm.snapshot permission for rollback
+    const resourceId = buildVmResourceId(connId, node, type, vmid)
+    const denied = await checkPermission(PERMISSIONS.VM_SNAPSHOT, "vm", resourceId)
+
+    if (denied) return denied
+
+    const conn = await getConnection(connId)
+
+    if (!conn) {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+    }
+
+    const scopeDenied = await guardSessionGuest({ connectionId: connId, conn, type, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    // A rollback restores the guest's NICs verbatim. If the vDC's network
+    // allocation changed since the snapshot (a VLAN pool revoked, perhaps
+    // reassigned to another tenant), rolling back would put the guest back on a
+    // network it may no longer use — potentially a neighbour's VLAN. Validate
+    // the snapshot's NICs against the CURRENT allow-list and refuse a rollback
+    // that would reintroduce a revoked network.
+    const rollbackTenantId = await getCurrentTenantId()
+    if (rollbackTenantId !== DEFAULT_TENANT_ID) {
+      const allowedNetworks = await getAllowedNetworksForTenant(rollbackTenantId, connId)
+      if (allowedNetworks !== null) {
+        let snapConfig: Record<string, unknown> = {}
+        try {
+          snapConfig = await pveFetch<Record<string, unknown>>(conn, snapshotPath(key, snapname, 'config'))
+        } catch {
+          return NextResponse.json({ error: 'Unable to verify the snapshot network scope' }, { status: 503 })
+        }
+        for (const [field, value] of Object.entries(snapConfig ?? {})) {
+          if (!/^net\d+$/.test(field)) continue
+          const verdict = validateNetAgainstScope(String(value ?? ''), allowedNetworks)
+          if (verdict.ok === false) {
+            return NextResponse.json(
+              { error: `Rollback refused: snapshot interface ${field} is no longer authorised for this vDC (${verdict.error})` },
+              { status: 403 },
+            )
+          }
+        }
+      }
+    }
+
+    // Storage-tier QoS policies (Finding I1): a snapshot taken before a
+    // storage policy existed re-applies its own drive lines verbatim on
+    // rollback, potentially handing back self-chosen QoS on a now-policied
+    // storage. Resolved eagerly (union scope, iaas only) ahead of the PVE
+    // rollback call and reused by the post-rollback restamp after() block
+    // below (cookies/request context die inside after()). The restamp is
+    // best-effort by design (spec §5.3): a DB/scope failure here must not
+    // turn a previously DB-free rollback into a 500, so it falls back to an
+    // empty policies map (no restamp scheduled) rather than throwing.
+    let rollbackPolicies: Map<string, DriveQosCaps> = new Map()
+    try {
+      const tenantId = await getCurrentTenantId()
+      const infra = await getTenantInfrastructureScope(tenantId, { ignoreVdcContext: true })
+      rollbackPolicies = infra.kind === 'iaas' && infra.vdcScope
+        ? (infra.vdcScope.storagePoliciesByConnection.get(connId) ?? new Map())
+        : new Map()
+    } catch (err: any) {
+      console.warn(`[rollback-qos-stamp] scope resolution failed for vmid=${safeLog(vmid)}, restamp skipped: ${safeLog(err?.message ?? err)}`)
+    }
+
+    const result = await pveFetch<string>(conn, snapshotPath(key, snapname, 'rollback'), {
+      method: 'POST',
+    })
+
+    // ── Post-rollback storage-tier QoS restamp ──
+    // qemu only: DATA_DISK_KEY_RE (inside restampGuestDrives) only matches
+    // qemu drive keys, lxc mountpoints use a different shape entirely
+    // (mirrors the clone/restore after() blocks).
+    if (type === 'qemu' && rollbackPolicies.size > 0 && result) {
+      const upid = String(result)
+      const configPath = `/nodes/${encodeURIComponent(node)}/qemu/${encodeURIComponent(vmid)}/config`
+      const rollbackLogTag = `[rollback-qos-stamp] vmid=${safeLog(vmid)}`
+      after(async () => {
+        try {
+          await waitForTask(conn, node, upid)
+        } catch (err: any) {
+          console.error(`${rollbackLogTag} waitForTask failed: ${safeLog(err?.message ?? err)}`)
+          return
+        }
+        await restampGuestDrives({ conn, configPath, policies: rollbackPolicies, logTag: rollbackLogTag })
+      })
+    }
+
+    // Audit
+    const { audit } = await import("@/lib/audit")
+
+    await audit({
+      action: "restore",
+      category: type === 'lxc' ? 'containers' : 'vms',
+      resourceType: type,
+      resourceId: vmid,
+      details: { node, connectionId: connId, snapshotName: snapname },
+    })
+
+    return NextResponse.json({
+      data: {
+        success: true,
+        upid: result,
+        message: `Rollback to snapshot '${snapname}' started`,
+      }
+    })
+  } catch (e: any) {
+    const excluded = licenseExcludedResponse(e)
+    if (excluded) return excluded
+    console.error("Snapshot rollback error:", e)
+
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+/**
+ * PUT /api/v1/guests/[vmid]/snapshots/[snapname]
+ * Mettre à jour la description d'un snapshot
+ * Body: { description: string }
+ */
+async function putHandler(
+  req: Request,
+  ctx: { params: Promise<Params> }
+) {
+  try {
+    const params = await ctx.params
+    const key = parseGuestKey(params.vmid)
+    if (!key.ok) return key.response
+    const { connId, type, node, vmid } = key
+    const snapname = params.snapname
+    if (!SNAPNAME_RE.test(snapname)) {
+      return NextResponse.json({ error: "Invalid snapshot name" }, { status: 400 })
+    }
+
+    // RBAC: Check vm.snapshot permission
+    const resourceId = buildVmResourceId(connId, node, type, vmid)
+    const denied = await checkPermission(PERMISSIONS.VM_SNAPSHOT, "vm", resourceId)
+
+    if (denied) return denied
+
+    const body = await req.json()
+
+    const { description } = body
+
+    const conn = await getConnection(connId)
+
+    if (!conn) {
+      return NextResponse.json({ error: "Connection not found" }, { status: 404 })
+    }
+
+    const scopeDenied = await guardSessionGuest({ connectionId: connId, conn, type, node, vmid })
+    if (scopeDenied) return scopeDenied
+
+    const formData = new URLSearchParams()
+
+    formData.append('description', description || '')
+
+    await pveFetch<any>(conn, snapshotPath(key, snapname, 'config'), {
+      method: 'PUT',
+      body: formData.toString(),
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded'
+      }
+    })
+
+    // Audit
+    const { audit } = await import("@/lib/audit")
+
+    await audit({
+      action: "update",
+      category: type === 'lxc' ? 'containers' : 'vms',
+      resourceType: type,
+      resourceId: vmid,
+      details: { node, connectionId: connId, snapshotName: snapname, description },
+    })
+
+    return NextResponse.json({
+      data: {
+        success: true,
+        message: `Snapshot '${snapname}' description updated`,
+      }
+    })
+  } catch (e: any) {
+    console.error("Snapshot update error:", e)
+
+return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const POST = withAudit({ category: "vms", resourceType: "snapshot", resourceParam: "snapname" }, withPublicApiGuard("vm-snapshot-rollback", postHandler))
+export const PUT = withAudit({ category: "vms", resourceType: "snapshot", resourceParam: "snapname" }, withPublicApiGuard("vm-snapshot-update", putHandler))

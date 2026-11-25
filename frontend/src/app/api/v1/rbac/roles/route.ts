@@ -1,0 +1,342 @@
+export const dynamic = "force-dynamic"
+// src/app/api/v1/rbac/roles/route.ts
+import { NextRequest, NextResponse } from "next/server"
+
+import { Prisma } from "@prisma/client"
+import { nanoid } from "nanoid"
+
+import { authorizeAdminRead, getActingSession } from "@/lib/auth/actingUser"
+import { demoResponse } from "@/lib/demo/demo-api"
+import { prisma } from "@/lib/db/prisma"
+import { audit } from "@/lib/audit"
+import { isUserSuperAdmin, PERMISSIONS, PROTECTED_ROLE_IDS } from "@/lib/rbac"
+import { validateRoleDefaultScopes } from "@/lib/rbac/scope-validation"
+import { parsePublicationInput, publicationFields, tenantCatalogueFilter } from "@/lib/rbac/rolePublication"
+import { findUnknownTenant, refuseOverCeiling } from "@/lib/rbac/catalogueGuards"
+import { DEFAULT_TENANT_ID } from "@/lib/tenant/constants"
+import { getCurrentTenantId } from "@/lib/tenant"
+import { withAudit } from "@/lib/audit/withAudit"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
+
+/**
+ * Normalize a client-supplied widget_overrides payload into the shape we
+ * persist: `{ hidden: string[] }` with deduped, trimmed entries. Returns
+ * `null` when the user explicitly clears the override, or `undefined` to
+ * leave the column untouched.
+ */
+function normalizeWidgetOverrides(raw: unknown): { hidden: string[] } | null | undefined {
+  if (raw === undefined) return undefined
+  if (raw === null) return null
+  if (typeof raw !== "object") return null
+
+  const hidden = (raw as any).hidden
+  if (!Array.isArray(hidden)) return null
+
+  const clean = Array.from(new Set(
+    hidden
+      .filter((h: any) => typeof h === "string")
+      .map((h: string) => h.trim())
+      .filter(Boolean),
+  ))
+
+  return clean.length === 0 ? null : { hidden: clean }
+}
+
+// GET /api/v1/rbac/roles - Liste tous les rôles
+async function handleGet(req: Request) {
+  const demo = demoResponse(req)
+  if (demo) return demo
+
+  try {
+    const reader = await authorizeAdminRead(PERMISSIONS.ADMIN_RBAC_VIEW)
+    if (reader.denied) return reader.denied
+
+    // Hide protected (wildcard) roles from non-super-admin callers so a tenant
+    // admin with admin.rbac can't assign themselves or others full cluster
+    // access.
+    const callerIsSuperAdmin = reader.isSuperAdmin
+    const tenantId = await getCurrentTenantId()
+
+    // Tenant scoping: callers see system/global roles (tenant_id IS NULL) plus
+    // the custom roles owned by their current tenant. Without this filter a
+    // role created from tenant A would leak into tenant B's admin UI.
+    // A customer tenant also sees the catalogue roles published to it with the
+    // "tenant" audience (ui#1336); service-desk roles stay a provider matter.
+    const providerView = tenantId === DEFAULT_TENANT_ID
+    const tenantScopeFilter = {
+      OR: [
+        { tenantId: null },
+        { tenantId },
+        ...(providerView ? [] : [tenantCatalogueFilter(tenantId)]),
+      ],
+    }
+    const protectedFilter = callerIsSuperAdmin ? {} : { id: { notIn: [...PROTECTED_ROLE_IDS] } }
+
+    const roles = await prisma.rbacRole.findMany({
+      where: { AND: [tenantScopeFilter, protectedFilter] },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        isSystem: true,
+        color: true,
+        widgetOverrides: true,
+        defaultScopes: true,
+        tenantId: true,
+        audience: true,
+        publishAll: true,
+        publications: { select: { tenantId: true } },
+        createdAt: true,
+        updatedAt: true,
+        permissions: {
+          select: {
+            permission: {
+              select: { id: true, name: true, category: true, description: true, isDangerous: true },
+            },
+          },
+        },
+        _count: {
+          select: {
+            userRoles: { where: { tenantId } },
+          },
+        },
+      },
+      orderBy: [{ isSystem: "desc" }, { name: "asc" }],
+    })
+
+    // A published role is held across tenants: the provider sees its total.
+    const crossTenantCounts = new Map<string, number>()
+    if (providerView) {
+      const publishedIds = roles.filter(r => r.audience && r.audience !== "provider").map(r => r.id)
+      if (publishedIds.length > 0) {
+        const counts = await prisma.rbacUserRole.groupBy({
+          by: ["roleId"],
+          where: { roleId: { in: publishedIds } },
+          _count: { _all: true },
+        })
+        for (const c of counts) crossTenantCounts.set(c.roleId, c._count._all)
+      }
+    }
+
+    const rolesWithDetails = roles.map(role => ({
+      id: role.id,
+      name: role.name,
+      description: role.description,
+      is_system: role.isSystem,
+      color: role.color,
+      widget_overrides: role.widgetOverrides ?? null,
+      default_scopes: role.defaultScopes ?? null,
+      tenant_id: role.tenantId,
+      ...publicationFields(role, providerView),
+      created_at: role.createdAt.toISOString(),
+      updated_at: role.updatedAt.toISOString(),
+      permissions: role.permissions.map(rp => ({
+        id: rp.permission.id,
+        name: rp.permission.name,
+        category: rp.permission.category,
+        description: rp.permission.description,
+        is_dangerous: rp.permission.isDangerous,
+      })),
+      user_count: crossTenantCounts.get(role.id) ?? role._count.userRoles,
+    }))
+
+    return NextResponse.json({
+      data: rolesWithDetails,
+      meta: { total: rolesWithDetails.length }
+    })
+
+  } catch (error: any) {
+    console.error("GET /api/v1/rbac/roles error:", error)
+
+return NextResponse.json(
+      { error: error.message || "Server error" },
+      { status: 500 }
+    )
+  }
+}
+
+export const GET = withPublicApiGuard("rbac-roles-list", handleGet)
+
+// POST /api/v1/rbac/roles - Créer un nouveau rôle
+async function handlePost(req: NextRequest) {
+  const demo = demoResponse(req)
+  if (demo) return demo
+
+  try {
+    const session = await getActingSession()
+
+    if (!session?.user) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
+    }
+
+    // Creating a role lets the caller bundle any permission — including
+    // provider-only ones — and then assign it. Reserve the ability to a
+    // super admin to prevent tenant admins from shadowing role_super_admin
+    // via a custom wildcard role.
+    if (!(await isUserSuperAdmin(session.user.id))) {
+      return NextResponse.json({ error: "Admin rights required" }, { status: 403 })
+    }
+
+    const body = await req.json()
+    const { name, description, color, permissions, widget_overrides, default_scopes } = body
+
+    if (!name || typeof name !== "string" || name.trim().length === 0) {
+      return NextResponse.json({ error: "Role name is required" }, { status: 400 })
+    }
+
+    // Role-level default scope (issue #383). New roles are always custom, so
+    // it's always allowed here; the validator rejects global/inherit entries.
+    let defaultScopes: { scopeType: string; scopeTarget: string }[] | undefined
+    if (default_scopes !== undefined && default_scopes !== null) {
+      const check = validateRoleDefaultScopes(default_scopes)
+      if (!check.ok) {
+        return NextResponse.json({ error: check.error }, { status: 400 })
+      }
+      defaultScopes = check.scopes.length ? check.scopes : undefined
+    }
+
+    // Catalogue audience and publication (ui#1336).
+    const publication = parsePublicationInput(body)
+    if (!publication.ok) {
+      return NextResponse.json({ error: publication.error }, { status: 400 })
+    }
+    const { audience, publishAll, tenantIds: publishedTenantIds } = publication.value!
+
+    const trimmedName = name.trim()
+    const now = new Date()
+    const id = `role_${nanoid(12)}`
+    const normalizedOverrides = normalizeWidgetOverrides(widget_overrides)
+    const ownerTenantId = await getCurrentTenantId()
+
+    // Custom roles are scoped to the creator's tenant. The compound unique
+    // (tenant_id, name) lets two tenants reuse the same role name without
+    // colliding, so the existence check is also tenant-scoped.
+    const existing = await prisma.rbacRole.findFirst({
+      where: { name: trimmedName, tenantId: ownerTenantId },
+      select: { id: true },
+    })
+
+    if (existing) {
+      return NextResponse.json({ error: "A role with this name already exists" }, { status: 400 })
+    }
+
+    const permIds: string[] = Array.isArray(permissions) ? permissions.filter((p: any) => typeof p === "string") : []
+
+    if (audience !== null) {
+      // One definition for every tenant: catalogue roles live in the provider tenant.
+      if (ownerTenantId !== DEFAULT_TENANT_ID) {
+        return NextResponse.json({ error: "Catalogue roles are created from the provider tenant" }, { status: 400 })
+      }
+      const refusal = await refuseOverCeiling(audience, permIds, session.user, trimmedName)
+      if (refusal) return refusal
+      const unknownTenant = await findUnknownTenant(publishedTenantIds)
+      if (unknownTenant) {
+        return NextResponse.json({ error: `Unknown tenant: ${unknownTenant}` }, { status: 400 })
+      }
+    }
+
+    // Créer le rôle + ses permissions atomiquement
+    await prisma.$transaction([
+      prisma.rbacRole.create({
+        data: {
+          id,
+          name: trimmedName,
+          description: description || null,
+          isSystem: false,
+          color: color || "#6366f1",
+          // Prisma Json? requires DbNull (not JS null) to write SQL NULL.
+          // undefined = field omitted on create, which is fine for "no override".
+          widgetOverrides:
+            normalizedOverrides === undefined ? undefined :
+            normalizedOverrides === null ? Prisma.DbNull :
+            normalizedOverrides,
+          defaultScopes: defaultScopes ?? undefined,
+          tenantId: ownerTenantId,
+          audience,
+          publishAll,
+          createdAt: now,
+          updatedAt: now,
+        },
+      }),
+      ...(publishedTenantIds.length > 0
+        ? [
+            prisma.rbacRolePublication.createMany({
+              data: publishedTenantIds.map(tenantId => ({ roleId: id, tenantId })),
+              skipDuplicates: true,
+            }),
+          ]
+        : []),
+      ...(permIds.length > 0
+        ? [
+            prisma.rbacRolePermission.createMany({
+              data: permIds.map(permissionId => ({ roleId: id, permissionId })),
+              skipDuplicates: true,
+            }),
+          ]
+        : []),
+    ])
+
+    // Audit
+    await audit({
+      action: "rbac_role_created",
+      category: "security",
+      userId: session.user.id,
+      userEmail: session.user.email,
+      resourceType: "rbac_role",
+      resourceId: id,
+      resourceName: trimmedName,
+      details: {
+        permissions: permIds.length,
+        ...(audience ? { audience, publish_all: publishAll, published_tenants: publishedTenantIds } : {}),
+      },
+      status: "success"
+    })
+
+    // Retourner le rôle créé avec ses permissions
+    const newRole = await prisma.rbacRole.findUnique({
+      where: { id },
+      include: {
+        permissions: { include: { permission: true } },
+        publications: { select: { tenantId: true } },
+      },
+    })
+
+    if (!newRole) {
+      return NextResponse.json({ error: "Creation failed" }, { status: 500 })
+    }
+
+    return NextResponse.json({
+      data: {
+        id: newRole.id,
+        name: newRole.name,
+        description: newRole.description,
+        is_system: newRole.isSystem,
+        color: newRole.color,
+        widget_overrides: newRole.widgetOverrides ?? null,
+        default_scopes: newRole.defaultScopes ?? null,
+        tenant_id: newRole.tenantId,
+        ...publicationFields(newRole, true),
+        created_at: newRole.createdAt.toISOString(),
+        updated_at: newRole.updatedAt.toISOString(),
+        permissions: newRole.permissions.map(rp => ({
+          id: rp.permission.id,
+          name: rp.permission.name,
+          category: rp.permission.category,
+          description: rp.permission.description,
+          is_dangerous: rp.permission.isDangerous,
+        })),
+        user_count: 0,
+      },
+    }, { status: 201 })
+
+  } catch (error: any) {
+    console.error("POST /api/v1/rbac/roles error:", error)
+
+return NextResponse.json(
+      { error: error.message || "Server error" },
+      { status: 500 }
+    )
+  }
+}
+
+export const POST = withAudit({ category: "security", resourceType: "role" }, handlePost)

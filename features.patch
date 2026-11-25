@@ -1,0 +1,958 @@
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/prisma/migrations/20261125120000_password_max_age/migration.sql /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/prisma/migrations/20261125120000_password_max_age/migration.sql
+--- proxcenter-ui-1.5.0/frontend/prisma/migrations/20261125120000_password_max_age/migration.sql	1970-01-01 00:00:00.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/prisma/migrations/20261125120000_password_max_age/migration.sql	2026-11-25 13:34:25.009058815 +0000
+@@ -0,0 +1,13 @@
++-- Password expiry policy (local build addition).
++-- security_policies gains the tunables (0 = disabled by default so an upgrade
++-- never locks anyone out); users gains the timestamp of the last local
++-- password set. Existing local-password accounts are backdated to
++-- created_at: their password is as old as the account, which is the honest
++-- age a "days since the password was set" policy must count from.
++
++ALTER TABLE "security_policies" ADD COLUMN "password_max_age_days" INTEGER NOT NULL DEFAULT 0;
++ALTER TABLE "security_policies" ADD COLUMN "password_warning_days" INTEGER NOT NULL DEFAULT 7;
++
++ALTER TABLE "users" ADD COLUMN "password_changed_at" TIMESTAMP(3);
++
++UPDATE "users" SET "password_changed_at" = "created_at" WHERE "password" IS NOT NULL;
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/prisma/schema.prisma /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/prisma/schema.prisma
+--- proxcenter-ui-1.5.0/frontend/prisma/schema.prisma	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/prisma/schema.prisma	2026-11-25 13:34:17.536038320 +0000
+@@ -476,6 +476,10 @@
+   localLoginAllowed Boolean @default(false) @map("local_login_allowed")
+   enabled      Boolean   @default(true)
+   lastLoginAt  DateTime? @map("last_login_at")
++  // When the local password was last set (created, changed by the user or
++  // reset by an admin). NULL = never recorded (accounts migrated before the
++  // column existed, or SSO-only accounts): those never expire.
++  passwordChangedAt DateTime? @map("password_changed_at")
+   createdAt    DateTime  @map("created_at")
+   updatedAt    DateTime  @map("updated_at")
+ 
+@@ -1667,6 +1671,10 @@
+   // X-Forwarded-For, trusting the last loginTrustedProxies hops only.
+   loginIpMaxFailedAttempts    Int      @default(0) @map("login_ip_max_failed_attempts")
+   loginTrustedProxies         Int      @default(1) @map("login_trusted_proxies")
++  // Password expiry policy (local build addition). maxAgeDays 0 = disabled;
++  // warningDays is how long before expiry the UI starts warning the user.
++  passwordMaxAgeDays          Int      @default(0) @map("password_max_age_days")
++  passwordWarningDays         Int      @default(7) @map("password_warning_days")
+   auditRetentionDays          Int      @default(90) @map("audit_retention_days")
+   auditAutoCleanup            Boolean  @default(false) @map("audit_auto_cleanup")
+   require2faForSuperAdmin     Boolean  @default(false) @map("require_2fa_for_super_admin")
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/app/(dashboard)/profile/page.jsx /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/(dashboard)/profile/page.jsx
+--- proxcenter-ui-1.5.0/frontend/src/app/(dashboard)/profile/page.jsx	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/(dashboard)/profile/page.jsx	2026-11-25 13:38:06.761652050 +0000
+@@ -73,6 +73,20 @@
+   const [profileError, setProfileError] = useState('')
+   const [passwordSuccess, setPasswordSuccess] = useState('')
+   const [passwordError, setPasswordError] = useState('')
++  // Password expiry banner (local addition): the signed-in user's own
++  // expiry state, reloaded after a successful password change.
++  const [passwordStatus, setPasswordStatus] = useState(null)
++
++  const loadPasswordStatus = () => {
++    fetch('/api/v1/auth/password-status')
++      .then(res => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
++      .then(body => setPasswordStatus(body?.data ?? null))
++      .catch(() => setPasswordStatus(null))
++  }
++
++  useEffect(() => {
++    loadPasswordStatus()
++  }, [])
+ 
+   // A user can hold several roles at once (SSO "combine every matching role",
+   // issue #1074): list each distinct one instead of the first and a counter.
+@@ -161,6 +175,16 @@
+ 
+   return (
+     <Box sx={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
++      {/* Password expiry warning (local addition): shown inside the policy's
++          warning window, e.g. 7 days before the deadline. */}
++      {passwordStatus?.enabled && passwordStatus?.daysRemaining !== null &&
++        passwordStatus.daysRemaining > 0 &&
++        passwordStatus.daysRemaining <= (passwordStatus.warningDays || 0) && (
++        <Alert severity='warning'>
++          {t('passwordPolicy.expiresSoon', { days: passwordStatus.daysRemaining })}
++          {passwordStatus.expiresAt && ' ' + t('passwordPolicy.expiresOn', { date: new Date(passwordStatus.expiresAt).toLocaleDateString() })}
++        </Alert>
++      )}
+       {/* Carte principale avec avatar et infos */}
+       <Card variant='outlined'>
+         <CardContent sx={{ p: 4 }}>
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/app/(dashboard)/settings/page.jsx /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/(dashboard)/settings/page.jsx
+--- proxcenter-ui-1.5.0/frontend/src/app/(dashboard)/settings/page.jsx	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/(dashboard)/settings/page.jsx	2026-11-25 13:36:26.706386306 +0000
+@@ -105,6 +105,11 @@
+   loading: tabLoading
+ })
+ 
++const PasswordPolicyTab = dynamic(() => import('@/components/settings/PasswordPolicyTab'), {
++  ssr: false,
++  loading: tabLoading
++})
++
+ const OidcConfigTab = dynamic(() => import('@/components/settings/oidc/OidcSettingsTab'), {
+   ssr: false,
+   loading: tabLoading
+@@ -2565,6 +2570,7 @@
+     { name: 'ldap', group: 'access', label: 'LDAP / Active Directory', icon: 'ri-server-line', component: LdapConfigTab, requiredFeature: Features.LDAP, providerOnly: true },
+     { name: 'oidc', group: 'access', label: 'OIDC / SSO', icon: 'ri-shield-keyhole-line', component: OidcConfigTab, requiredFeature: Features.OIDC, providerOnly: true },
+     { name: 'identity', group: 'access', label: t('oidc.tenantConnections.tenantTabLabel'), icon: 'ri-shield-user-line', component: TenantIdentityTab, requiredFeature: Features.OIDC, customerTenantPermission: 'admin.identity' },
++    { name: 'password-policy', group: 'access', label: t('passwordPolicy.tabLabel'), icon: 'ri-key-2-line', component: PasswordPolicyTab, providerOnly: true },
+     { name: 'api', group: 'access', label: t('settings.apiTokens.tabLabel'), icon: 'ri-code-box-line', component: ApiTokensTab, providerOnly: true },
+     { name: 'tls', group: 'access', label: t('settings.tls.tabLabel'), icon: 'ri-lock-line', component: TlsTab, providerOnly: true },
+     { name: 'alert-thresholds', group: 'monitoring', label: t('settings.alertThresholds.title'), icon: 'ri-alarm-warning-line', component: AlertThresholdsTab, providerOnly: true },
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/app/api/v1/auth/password-status/route.ts /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/api/v1/auth/password-status/route.ts
+--- proxcenter-ui-1.5.0/frontend/src/app/api/v1/auth/password-status/route.ts	1970-01-01 00:00:00.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/api/v1/auth/password-status/route.ts	2026-11-25 13:35:51.744293190 +0000
+@@ -0,0 +1,41 @@
++// GET /api/v1/auth/password-status (local build addition)
++//
++// The signed-in user's own password-expiry state under the current policy.
++// The profile page uses it for the "your password expires in N days" banner.
++// Anonymous or SSO-only accounts get a disabled status, never an error, so
++// the client can render it unconditionally.
++import { NextResponse } from 'next/server'
++import { getServerSession } from 'next-auth'
++
++import { authOptions } from '@/lib/auth/config'
++import { getCurrentTenantId } from '@/lib/tenant'
++import { getUserPasswordAgeStatus } from '@/lib/compliance/policies'
++
++export const runtime = 'nodejs'
++export const dynamic = 'force-dynamic'
++
++export async function GET() {
++  try {
++    const session = await getServerSession(authOptions)
++    if (!session?.user?.id) {
++      return NextResponse.json({ data: { enabled: false, authenticated: false } })
++    }
++
++    const tenantId = await getCurrentTenantId().catch(() => 'default')
++    const status = await getUserPasswordAgeStatus(session.user.id, tenantId)
++
++    return NextResponse.json({
++      data: {
++        enabled: status.enabled,
++        authenticated: true,
++        passwordChangedAt: status.passwordChangedAt?.toISOString() ?? null,
++        expiresAt: status.expiresAt?.toISOString() ?? null,
++        daysRemaining: status.daysRemaining,
++        warningDays: status.warningDays,
++      },
++    })
++  } catch (e: any) {
++    console.error('Error fetching password status:', e)
++    return NextResponse.json({ error: e?.message || 'Internal server error' }, { status: 500 })
++  }
++}
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/app/api/v1/settings/password-policy/route.ts /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/api/v1/settings/password-policy/route.ts
+--- proxcenter-ui-1.5.0/frontend/src/app/api/v1/settings/password-policy/route.ts	1970-01-01 00:00:00.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/api/v1/settings/password-policy/route.ts	2026-11-25 13:35:42.508268483 +0000
+@@ -0,0 +1,98 @@
++// GET/PUT /api/v1/settings/password-policy (local build addition)
++//
++// Reads and writes ONLY the password-expiry tunables of security_policies
++// (password_max_age_days, password_warning_days). Deliberately separate from
++// /api/v1/compliance/policies, which gates on ADMIN_COMPLIANCE: the expiry
++// settings belong to access administration (admin.settings), so an
++// installation can run a password-expiry policy without opening the whole
++// compliance module.
++import { NextResponse } from 'next/server'
++import { getServerSession } from 'next-auth'
++
++import { authOptions } from '@/lib/auth/config'
++import { checkPermission, PERMISSIONS } from '@/lib/rbac'
++import { getCurrentTenantId } from '@/lib/tenant'
++import { audit } from '@/lib/audit'
++import {
++  E_PASSWORD_MAX_AGE_INVALID,
++  E_PASSWORD_WARNING_INVALID,
++  getSecurityPolicies,
++  updateSecurityPolicies,
++} from '@/lib/compliance/policies'
++
++export const runtime = 'nodejs'
++export const dynamic = 'force-dynamic'
++
++export async function GET() {
++  try {
++    const denied = await checkPermission(PERMISSIONS.ADMIN_SETTINGS)
++    if (denied) return denied
++
++    const tenantId = await getCurrentTenantId()
++    const policies = await getSecurityPolicies(tenantId)
++
++    return NextResponse.json({
++      data: {
++        password_max_age_days: policies.password_max_age_days,
++        password_warning_days: policies.password_warning_days,
++        updated_at: policies.updated_at,
++        updated_by: policies.updated_by,
++      },
++    })
++  } catch (e: any) {
++    console.error('Error fetching password policy:', e)
++    return NextResponse.json({ error: e?.message || 'Internal server error' }, { status: 500 })
++  }
++}
++
++export async function PUT(req: Request) {
++  try {
++    const denied = await checkPermission(PERMISSIONS.ADMIN_SETTINGS)
++    if (denied) return denied
++
++    const session = await getServerSession(authOptions)
++    if (!session?.user?.id) {
++      return NextResponse.json({ error: 'Not authenticated' }, { status: 401 })
++    }
++
++    const body = await req.json().catch(() => null)
++    if (!body || typeof body !== 'object') {
++      return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 })
++    }
++
++    // Whitelist: only the two expiry tunables pass through, whatever else the
++    // payload carries (a hidden compliance field, an id, an audit stamp).
++    const allowed = ['password_max_age_days', 'password_warning_days'] as const
++    const partial: Record<string, unknown> = {}
++    for (const key of allowed) {
++      if (key in body) partial[key] = (body as Record<string, unknown>)[key]
++    }
++
++    const tenantId = await getCurrentTenantId()
++    const updated = await updateSecurityPolicies(partial, session.user.id, tenantId)
++
++    await audit({
++      action: 'update',
++      category: 'security',
++      resourceType: 'security_policies',
++      resourceId: 'default',
++      resourceName: 'Password policy',
++      details: partial,
++    })
++
++    return NextResponse.json({
++      data: {
++        password_max_age_days: updated.password_max_age_days,
++        password_warning_days: updated.password_warning_days,
++        updated_at: updated.updated_at,
++        updated_by: updated.updated_by,
++      },
++    })
++  } catch (e: any) {
++    if (e?.message === E_PASSWORD_MAX_AGE_INVALID || e?.message === E_PASSWORD_WARNING_INVALID) {
++      return NextResponse.json({ error: e.message, code: e.message }, { status: 400 })
++    }
++    console.error('Error updating password policy:', e)
++    return NextResponse.json({ error: e?.message || 'Internal server error' }, { status: 500 })
++  }
++}
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/app/api/v1/users/[id]/route.ts /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/api/v1/users/[id]/route.ts
+--- proxcenter-ui-1.5.0/frontend/src/app/api/v1/users/[id]/route.ts	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/api/v1/users/[id]/route.ts	2026-11-25 13:35:25.738223457 +0000
+@@ -173,7 +173,11 @@
+         return NextResponse.json({ error: "Only a super admin may change emergency access" }, { status: 403 })
+       }
+       data.localLoginAllowed = localLoginAllowed
+-      if (!localLoginAllowed && isExternalProvider(user.authProvider) && user.password) data.password = null
++      if (!localLoginAllowed && isExternalProvider(user.authProvider) && user.password) {
++        data.password = null
++        // No local password left: the expiry clock resets with it.
++        data.passwordChangedAt = null
++      }
+     }
+     const localLoginAfter = localLoginAllowed ?? user.localLoginAllowed
+     // Password is owned by the external IdP for SSO/LDAP accounts. Refuse to set
+@@ -194,6 +198,9 @@
+         )
+       }
+       data.password = await hashPassword(password)
++      // Password expiry (local addition): any admin reset or self-service
++      // change restarts the max-age clock.
++      data.passwordChangedAt = new Date()
+     }
+ 
+     const requestedTenantIds = Array.isArray(tenantIds)
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/app/api/v1/users/route.ts /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/api/v1/users/route.ts
+--- proxcenter-ui-1.5.0/frontend/src/app/api/v1/users/route.ts	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/app/api/v1/users/route.ts	2026-11-25 13:35:15.642196341 +0000
+@@ -261,6 +261,9 @@
+           id,
+           email: normalisedEmail,
+           password: hashedPassword,
++          // Password expiry (local addition): a new password starts its
++          // max-age clock now.
++          passwordChangedAt: now,
+           name: name || null,
+           role: grantSuperAdmin ? "super_admin" : "user",
+           authProvider: "credentials",
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/components/settings/PasswordPolicyTab.tsx /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/components/settings/PasswordPolicyTab.tsx
+--- proxcenter-ui-1.5.0/frontend/src/components/settings/PasswordPolicyTab.tsx	1970-01-01 00:00:00.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/components/settings/PasswordPolicyTab.tsx	2026-11-25 13:36:18.355364100 +0000
+@@ -0,0 +1,195 @@
++'use client'
++
++// Password Policy tab (local build addition): Settings → Access control →
++// Password Policy. Reads and writes ONLY the password-expiry tunables of the
++// security_policies row via /api/v1/settings/password-policy (admin.settings
++// gated, providerOnly tab). The complexity rules keep living on the
++// Compliance page; this tab is about the max age and its warning window.
++
++import { useEffect, useState } from 'react'
++
++import {
++  Alert,
++  Box,
++  Button,
++  Card,
++  CardContent,
++  CircularProgress,
++  FormControlLabel,
++  Stack,
++  Switch,
++  TextField,
++  Typography,
++} from '@mui/material'
++import { useTranslations } from 'next-intl'
++
++const MAX_AGE_MAX = 3650
++const WARNING_MAX = 365
++
++interface PasswordPolicy {
++  password_max_age_days: number
++  password_warning_days: number
++  updated_at?: string
++  updated_by?: string | null
++}
++
++export default function PasswordPolicyTab() {
++  const t = useTranslations('passwordPolicy')
++  const [loading, setLoading] = useState(true)
++  const [saving, setSaving] = useState(false)
++  const [error, setError] = useState('')
++  const [success, setSuccess] = useState('')
++  const [enabled, setEnabled] = useState(false)
++  const [maxAgeDays, setMaxAgeDays] = useState('90')
++  const [warningDays, setWarningDays] = useState('7')
++
++  useEffect(() => {
++    let cancelled = false
++
++    fetch('/api/v1/settings/password-policy')
++      .then(res => (res.ok ? res.json() : Promise.reject(new Error(`HTTP ${res.status}`))))
++      .then(body => {
++        if (cancelled) return
++        const policy: PasswordPolicy = body?.data ?? {}
++        const days = Number(policy.password_max_age_days) || 0
++        setEnabled(days > 0)
++        setMaxAgeDays(String(days > 0 ? days : 90))
++        setWarningDays(String(Number(policy.password_warning_days) || 7))
++        setLoading(false)
++      })
++      .catch(() => {
++        if (!cancelled) {
++          setError(t('loadError'))
++          setLoading(false)
++        }
++      })
++
++    return () => {
++      cancelled = true
++    }
++  }, [t])
++
++  const maxAgeInvalid = !/^\d+$/.test(maxAgeDays) || Number(maxAgeDays) > MAX_AGE_MAX
++  const warningInvalid = !/^\d+$/.test(warningDays) || Number(warningDays) > WARNING_MAX
++  // A warning window at or beyond the total age would warn from day zero.
++  const windowInvalid =
++    enabled && !maxAgeInvalid && !warningInvalid && Number(warningDays) >= Number(maxAgeDays)
++
++  const handleSave = async () => {
++    setSaving(true)
++    setError('')
++    setSuccess('')
++
++    try {
++      const res = await fetch('/api/v1/settings/password-policy', {
++        method: 'PUT',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({
++          password_max_age_days: enabled ? Number(maxAgeDays) : 0,
++          password_warning_days: Number(warningDays),
++        }),
++      })
++      const body = await res.json().catch(() => null)
++
++      if (!res.ok) {
++        setError(body?.code === 'E_PASSWORD_MAX_AGE_INVALID' || body?.code === 'E_PASSWORD_WARNING_INVALID'
++          ? t('invalidRange', { max: Math.max(MAX_AGE_MAX, WARNING_MAX) })
++          : body?.error || t('saveError'))
++        return
++      }
++
++      setSuccess(t('saved'))
++    } catch {
++      setError(t('saveError'))
++    } finally {
++      setSaving(false)
++    }
++  }
++
++  if (loading) {
++    return (
++      <Box sx={{ display: 'flex', justifyContent: 'center', py: 8 }}>
++        <CircularProgress size={28} />
++      </Box>
++    )
++  }
++
++  return (
++    <Stack spacing={3} sx={{ maxWidth: 720 }}>
++      <Card variant='outlined'>
++        <CardContent>
++          <Typography variant='h6' fontWeight={700} gutterBottom>
++            {t('title')}
++          </Typography>
++          <Typography variant='body2' sx={{ opacity: 0.75, mb: 2 }}>
++            {t('description')}
++          </Typography>
++
++          {error && <Alert severity='error' sx={{ mb: 2 }}>{error}</Alert>}
++          {success && <Alert severity='success' sx={{ mb: 2 }}>{success}</Alert>}
++
++          <FormControlLabel
++            control={<Switch checked={enabled} onChange={e => setEnabled(e.target.checked)} />}
++            label={t('enableLabel')}
++            sx={{ mb: 2 }}
++          />
++
++          <Stack spacing={2}>
++            <TextField
++              select={false}
++              label={t('maxAgeLabel')}
++              value={maxAgeDays}
++              onChange={e => setMaxAgeDays(e.target.value)}
++              disabled={!enabled || saving}
++              error={enabled && maxAgeInvalid}
++              helperText={
++                enabled
++                  ? maxAgeInvalid
++                    ? t('maxAgeError', { max: MAX_AGE_MAX })
++                    : t('maxAgeHelper')
++                  : t('disabledHelper')
++              }
++              type='number'
++              size='small'
++              sx={{ maxWidth: 280 }}
++            />
++            <TextField
++              select={false}
++              label={t('warningLabel')}
++              value={warningDays}
++              onChange={e => setWarningDays(e.target.value)}
++              disabled={!enabled || saving}
++              error={enabled && (warningInvalid || windowInvalid)}
++              helperText={
++                enabled
++                  ? warningInvalid
++                    ? t('warningError', { max: WARNING_MAX })
++                    : windowInvalid
++                      ? t('windowError')
++                      : t('warningHelper')
++                  : t('disabledHelper')
++              }
++              type='number'
++              size='small'
++              sx={{ maxWidth: 280 }}
++            />
++          </Stack>
++
++          <Box sx={{ mt: 3, display: 'flex', gap: 2 }}>
++            <Button
++              variant='contained'
++              onClick={handleSave}
++              disabled={saving || (enabled && (maxAgeInvalid || warningInvalid || windowInvalid))}
++            >
++              {saving ? t('saving') : t('save')}
++            </Button>
++          </Box>
++
++          <Typography variant='caption' sx={{ display: 'block', mt: 2, opacity: 0.6 }}>
++            {t('note')}
++          </Typography>
++        </CardContent>
++      </Card>
++    </Stack>
++  )
++}
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/lib/auth/config.ts /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/lib/auth/config.ts
+--- proxcenter-ui-1.5.0/frontend/src/lib/auth/config.ts	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/lib/auth/config.ts	2026-11-25 13:35:05.811169819 +0000
+@@ -7,6 +7,7 @@
+ 
+ import { prisma } from "@/lib/db/prisma"
+ import { verifyPassword, hashPassword, needsRehash, burnPasswordCheck } from "./password"
++import { getUserPasswordAgeStatus } from "@/lib/compliance/policies"
+ import { auditKeptForLastSuperAdmin, isExternalProvider, isLastLocalSuperAdmin, localPasswordOnExternalSignIn } from "./localLogin"
+ import { readGroupsClaim, isLdapGroupAllowed } from "./groupMapping"
+ import { authenticateLdapDetailed, isLdapEnabled, getLdapConfig, resolveLdapRole, syncLdapRoleAssignment } from "./ldap"
+@@ -207,6 +208,7 @@
+             localLoginAllowed: true,
+             enabled: true,
+             totpEnabled: true,
++            passwordChangedAt: true,
+           },
+         })
+ 
+@@ -266,6 +268,18 @@
+           throw new Error("Invalid credentials")
+         }
+ 
++        // Password expiry policy (local build addition, security_policies.
++        // password_max_age_days): an expired local password refuses the login
++        // outright — an admin resets it, or the user gets a new one. Checked
++        // AFTER the password verifies (so the message never confirms a
++        // correct guess) and BEFORE the second factor; lockout "none": an
++        // expired password is not a brute-force attempt.
++        const expiry = await getUserPasswordAgeStatus(user.id)
++        if (expiry.enabled && expiry.daysRemaining !== null && expiry.daysRemaining <= 0) {
++          await logFailure("Password expired", "none")
++          throw new Error("PASSWORD_EXPIRED")
++        }
++
+         if (keepForLastSuperAdmin) {
+           await prisma.user.update({ where: { id: user.id }, data: { localLoginAllowed: true } })
+           await auditKeptForLastSuperAdmin(user.email, user.authProvider as "ldap" | "oidc")
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/lib/compliance/policies.ts /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/lib/compliance/policies.ts
+--- proxcenter-ui-1.5.0/frontend/src/lib/compliance/policies.ts	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/lib/compliance/policies.ts	2026-11-25 13:34:49.925126844 +0000
+@@ -24,6 +24,8 @@
+   password_require_lowercase: boolean
+   password_require_numbers: boolean
+   password_require_special: boolean
++  password_max_age_days: number
++  password_warning_days: number
+   session_timeout_minutes: number
+   session_max_concurrent: number
+   login_max_failed_attempts: number
+@@ -47,6 +49,12 @@
+ export const AUDIT_RETENTION_MIN_DAYS = 30
+ export const E_AUDIT_RETENTION_TOO_SHORT = 'E_AUDIT_RETENTION_TOO_SHORT'
+ 
++/** Upper bounds accepted for the password expiry tunables (local addition). */
++export const PASSWORD_MAX_AGE_MAX_DAYS = 3650
++export const PASSWORD_WARNING_MAX_DAYS = 365
++export const E_PASSWORD_MAX_AGE_INVALID = 'E_PASSWORD_MAX_AGE_INVALID'
++export const E_PASSWORD_WARNING_INVALID = 'E_PASSWORD_WARNING_INVALID'
++
+ /** Retention days the sweeper applies for a stored value. */
+ export function effectiveAuditRetentionDays(days: number): number {
+   return Math.max(AUDIT_RETENTION_MIN_DAYS, Math.trunc(days))
+@@ -79,6 +87,74 @@
+   }
+ }
+ 
++/**
++ * Validity of the password-expiry tunables (local addition): integers within
++ * their bounds, 0 = disabled for the max age. Throws instead of silently
++ * dropping like updateSecurityPolicies does for generic numbers, so a typo
++ * in the API payload can never turn an "180 days" policy into "no policy".
++ */
++function assertValidPasswordExpiry(partial: Partial<Record<string, unknown>>): void {
++  if ('password_max_age_days' in partial) {
++    const value = partial.password_max_age_days
++    const valid =
++      typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= PASSWORD_MAX_AGE_MAX_DAYS
++    if (!valid) throw new Error(E_PASSWORD_MAX_AGE_INVALID)
++  }
++  if ('password_warning_days' in partial) {
++    const value = partial.password_warning_days
++    const valid =
++      typeof value === 'number' && Number.isInteger(value) && value >= 0 && value <= PASSWORD_WARNING_MAX_DAYS
++    if (!valid) throw new Error(E_PASSWORD_WARNING_INVALID)
++  }
++}
++
++export interface PasswordAgeStatus {
++  /** The policy applies to this account at all. */
++  enabled: boolean
++  /** When the local password was last set; null = never recorded (never expires). */
++  passwordChangedAt: Date | null
++  /** When the password expires under the current policy; null = never. */
++  expiresAt: Date | null
++  /** Days left before expiry (ceil); null = never expires. */
++  daysRemaining: number | null
++  /** The policy's warning window, in days. */
++  warningDays: number
++}
++
++/**
++ * Expiry state of ONE user's local password under the CURRENT policy.
++ * Shared by the login gate (config.ts) and the /auth/password-status route.
++ * A missing timestamp (SSO-only accounts, pre-migration rows) never expires.
++ */
++export async function getUserPasswordAgeStatus(
++  userId: string,
++  tenantId: string = 'default',
++): Promise<PasswordAgeStatus> {
++  const [policy, user] = await Promise.all([
++    prisma.securityPolicy.findFirst({
++      where: { id: 'default', tenantId },
++      select: { passwordMaxAgeDays: true, passwordWarningDays: true },
++    }),
++    prisma.user.findUnique({
++      where: { id: userId },
++      select: { passwordChangedAt: true, password: true },
++    }),
++  ])
++
++  const maxAgeDays = policy?.passwordMaxAgeDays ?? 0
++  const warningDays = policy?.passwordWarningDays ?? 7
++  const passwordChangedAt = user?.passwordChangedAt ?? null
++
++  if (maxAgeDays <= 0 || !passwordChangedAt) {
++    return { enabled: maxAgeDays > 0, passwordChangedAt, expiresAt: null, daysRemaining: null, warningDays }
++  }
++
++  const expiresAt = new Date(passwordChangedAt.getTime() + maxAgeDays * 86_400_000)
++  const daysRemaining = Math.ceil((expiresAt.getTime() - Date.now()) / 86_400_000)
++
++  return { enabled: true, passwordChangedAt, expiresAt, daysRemaining, warningDays }
++}
++
+ function rowToPolicies(row: PrismaRow): SecurityPolicies {
+   return {
+     id: row.id,
+@@ -87,6 +163,8 @@
+     password_require_lowercase: row.passwordRequireLowercase,
+     password_require_numbers: row.passwordRequireNumbers,
+     password_require_special: row.passwordRequireSpecial,
++    password_max_age_days: row.passwordMaxAgeDays,
++    password_warning_days: row.passwordWarningDays,
+     session_timeout_minutes: row.sessionTimeoutMinutes,
+     session_max_concurrent: row.sessionMaxConcurrent,
+     login_max_failed_attempts: row.loginMaxFailedAttempts,
+@@ -127,6 +205,8 @@
+   password_require_lowercase: 'passwordRequireLowercase',
+   password_require_numbers: 'passwordRequireNumbers',
+   password_require_special: 'passwordRequireSpecial',
++  password_max_age_days: 'passwordMaxAgeDays',
++  password_warning_days: 'passwordWarningDays',
+   session_timeout_minutes: 'sessionTimeoutMinutes',
+   session_max_concurrent: 'sessionMaxConcurrent',
+   login_max_failed_attempts: 'loginMaxFailedAttempts',
+@@ -171,6 +251,7 @@
+   // Refused outright rather than dropped like the other tunables: the sweeper
+   // deletes rows for good, so a too-short value must never be saved silently.
+   assertValidAuditRetention(partial)
++  assertValidPasswordExpiry(partial)
+   await assertCanEnable2faPolicy(partial, userId, tenantId)
+ 
+   const data: Prisma.SecurityPolicyUpdateInput = {}
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/lib/license/features.test.ts /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/lib/license/features.test.ts
+--- proxcenter-ui-1.5.0/frontend/src/lib/license/features.test.ts	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/lib/license/features.test.ts	2026-11-25 13:47:15.791104945 +0000
+@@ -46,6 +46,33 @@
+     expect(effectiveHasFeature({}, Features.DRS)).toBe(false)
+     expect(effectiveHasFeature({ licensed: false, edition: 'enterprise', options: ['control_plane_ha'] }, Features.HA)).toBe(false)
+   })
++  // Local build override (AGPL-3.0 modification of the Community Edition
++  // source): OIDC SSO, RBAC user management (with multi-tenancy), LDAP/AD,
++  // the API Access add-on, Syslog forwarding and control-plane HA are
++  // force-granted regardless of the license verdict, community included and
++  // even with no license status at all.
++  it('force-grants OIDC, RBAC, multi-tenancy, LDAP, API access, syslog and HA regardless of the license verdict', () => {
++    for (const id of [Features.OIDC, Features.RBAC, Features.MULTI_TENANCY, Features.LDAP, Features.API_ACCESS, Features.SYSLOG_FORWARDING, Features.HA]) {
++      expect(effectiveHasFeature(null, id), `${id} forced with null status`).toBe(true)
++      expect(effectiveHasFeature(undefined, id), `${id} forced with undefined status`).toBe(true)
++      expect(effectiveHasFeature({}, id), `${id} forced with an empty status`).toBe(true)
++      expect(
++        effectiveHasFeature({ licensed: false, expired: false, edition: 'community' }, id),
++        `${id} forced on an unlicensed community`,
++      ).toBe(true)
++      expect(
++        effectiveHasFeature({ licensed: true, expired: true, edition: 'enterprise' }, id),
++        `${id} forced even when expired`,
++      ).toBe(true)
++    }
++  })
++  it('keeps every other feature fail-closed on community', () => {
++    const community = { licensed: false, expired: false, edition: 'community' }
++    expect(effectiveHasFeature(community, Features.DRS)).toBe(false)
++    expect(effectiveHasFeature(community, Features.AI_INSIGHTS)).toBe(false)
++    expect(effectiveHasFeature(community, 'white_label')).toBe(false)
++    expect(effectiveHasFeature(community, 'sla_monitoring')).toBe(false)
++  })
+ })
+ 
+ describe('registry and edition mapping invariants', () => {
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/lib/license/features.ts /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/lib/license/features.ts
+--- proxcenter-ui-1.5.0/frontend/src/lib/license/features.ts	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/lib/license/features.ts	2026-11-25 13:47:03.917073739 +0000
+@@ -143,6 +143,24 @@
+ }
+ 
+ /**
++ * Features force-granted regardless of the license verdict (local build
++ * override, AGPL-3.0 modification of the Community Edition source):
++ * OIDC SSO, RBAC user management (incl. multi-tenancy, which the users/RBAC
++ * pages need for cross-tenant assignment), the LDAP/AD directory, the API
++ * Access add-on, Syslog/SIEM log forwarding and the ProxCenter control-plane
++ * HA add-on. Every other feature keeps its original fail-closed behaviour.
++ */
++const FORCE_GRANTED_FEATURES: readonly string[] = [
++  Features.OIDC,
++  Features.RBAC,
++  Features.MULTI_TENANCY,
++  Features.LDAP,
++  Features.API_ACCESS,
++  Features.SYSLOG_FORWARDING,
++  Features.HA,
++]
++
++/**
+  * Effective feature check shared by client (LicenseContext) and server
+  * (requireFeature, inventory poller). Fail-closed: null/undefined status,
+  * unlicensed or expired always deny. Option capabilities are only honored on
+@@ -153,6 +171,7 @@
+   status: LicenseStatusLike | null | undefined,
+   id: string,
+ ): boolean {
++  if (FORCE_GRANTED_FEATURES.includes(id)) return true
+   if (!status || status.licensed !== true || status.expired === true) return false
+   const editionFeatures = EDITION_FEATURES[status.edition || '']
+   if (editionFeatures?.includes(id as FeatureId)) return true
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/messages/de.json /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/de.json
+--- proxcenter-ui-1.5.0/frontend/src/messages/de.json	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/de.json	2026-11-25 13:37:58.147629164 +0000
+@@ -205,7 +205,31 @@
+     "defaultTagline": "Die Proxmox Datacenter-Management-Plattform",
+     "defaultHighlightMultiTenant": "Mandantenfähige vDC",
+     "defaultHighlightBackup": "Backup-Orchestrierung",
+-    "defaultHighlightWhiteLabel": "MSP White-Label"
++    "defaultHighlightWhiteLabel": "MSP White-Label",
++    "passwordExpired": "Ihr Passwort ist abgelaufen. Bitten Sie einen Administrator, es zurückzusetzen, oder melden Sie sich mit einem anderen Konto an."
++  },
++  "passwordPolicy": {
++    "tabLabel": "Passwort-Richtlinie",
++    "title": "Passwort-Ablauf",
++    "description": "Lokale Passwörter müssen nach einer festen Anzahl von Tagen erneuert werden. OIDC/LDAP-Konten verwaltet deren Identitätsanbieter und sind nicht betroffen.",
++    "enableLabel": "Regelmäßigen Passwortwechsel erzwingen",
++    "maxAgeLabel": "Gültigkeit des Passworts (Tage)",
++    "maxAgeHelper": "Benutzer müssen ihr Passwort nach so vielen Tagen ändern; 0 deaktiviert die Richtlinie.",
++    "maxAgeError": "Ganze Anzahl von Tagen zwischen 1 und {max} eingeben.",
++    "warningLabel": "Warnung vor Ablauf (Tage)",
++    "warningHelper": "So viele Tage vor Ablauf warnt die Oberfläche den Benutzer.",
++    "warningError": "Ganze Anzahl von Tagen zwischen 0 und {max} eingeben.",
++    "windowError": "Das Warnfenster muss kürzer als die Gesamtgültigkeit sein.",
++    "disabledHelper": "Zum Bearbeiten zuerst die Richtlinie oben aktivieren.",
++    "save": "Speichern",
++    "saving": "Speichern…",
++    "saved": "Passwort-Richtlinie erfolgreich gespeichert",
++    "saveError": "Speichern der Passwort-Richtlinie fehlgeschlagen",
++    "loadError": "Laden der Passwort-Richtlinie fehlgeschlagen",
++    "invalidRange": "Ganze Anzahl von Tagen zwischen 1 und {max} eingeben.",
++    "note": "Geänderte oder zurückgesetzte Passwörter starten die Gültigkeit neu. Bestehende Konten ohne erfasstes Passwortdatum bleiben bis zur nächsten Passwortänderung unberührt.",
++    "expiresSoon": "Ihr Passwort läuft in {days} Tag(en) ab. Ändern Sie es unten, um angemeldet zu bleiben.",
++    "expiresOn": "Läuft am {date} ab."
+   },
+   "navigation": {
+     "dashboard": "Dashboard",
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/messages/en.json /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/en.json
+--- proxcenter-ui-1.5.0/frontend/src/messages/en.json	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/en.json	2026-11-25 13:37:58.095629026 +0000
+@@ -201,7 +201,31 @@
+     "defaultTagline": "The Proxmox Datacenter Management Platform",
+     "defaultHighlightMultiTenant": "Multi-tenant vDC",
+     "defaultHighlightBackup": "Backup orchestration",
+-    "defaultHighlightWhiteLabel": "MSP white-label"
++    "defaultHighlightWhiteLabel": "MSP white-label",
++    "passwordExpired": "Your password has expired. Ask an administrator to reset it, or sign in with another account."
++  },
++  "passwordPolicy": {
++    "tabLabel": "Password Policy",
++    "title": "Password expiry",
++    "description": "Force local passwords to be rotated after a fixed number of days. OIDC/LDAP accounts are managed by their identity provider and are never affected.",
++    "enableLabel": "Require periodic password change",
++    "maxAgeLabel": "Password validity (days)",
++    "maxAgeHelper": "Users must change their password after this many days; 0 disables the policy.",
++    "maxAgeError": "Enter a whole number of days between 1 and {max}.",
++    "warningLabel": "Warning before expiry (days)",
++    "warningHelper": "How many days before expiry the interface starts warning the user.",
++    "warningError": "Enter a whole number of days between 0 and {max}.",
++    "windowError": "The warning window must be shorter than the total validity period.",
++    "disabledHelper": "Enable the policy above to edit.",
++    "save": "Save",
++    "saving": "Saving…",
++    "saved": "Password policy saved successfully",
++    "saveError": "Failed to save the password policy",
++    "loadError": "Failed to load the password policy",
++    "invalidRange": "Enter a whole number of days between 1 and {max}.",
++    "note": "Changed or reset passwords restart the validity period. Pre-existing accounts whose password age was never recorded keep signing in until their password is next changed.",
++    "expiresSoon": "Your password expires in {days} day(s). Change it below to stay signed in.",
++    "expiresOn": "Expires on {date}."
+   },
+   "navigation": {
+     "dashboard": "Dashboard",
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/messages/es.json /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/es.json
+--- proxcenter-ui-1.5.0/frontend/src/messages/es.json	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/es.json	2026-11-25 13:37:58.198629301 +0000
+@@ -201,7 +201,31 @@
+     "defaultTagline": "La plataforma de gestión de datacenters Proxmox",
+     "defaultHighlightMultiTenant": "vDC multi-tenant",
+     "defaultHighlightBackup": "Orquestación de backups",
+-    "defaultHighlightWhiteLabel": "Marca blanca MSP"
++    "defaultHighlightWhiteLabel": "Marca blanca MSP",
++    "passwordExpired": "Su contraseña ha caducado. Pida a un administrador que la restablezca o inicie sesión con otra cuenta."
++  },
++  "passwordPolicy": {
++    "tabLabel": "Política de contraseñas",
++    "title": "Caducidad de la contraseña",
++    "description": "Las contraseñas locales deben renovarse tras un número fijo de días. Las cuentas OIDC/LDAP las gestiona su proveedor de identidad y no se ven afectadas.",
++    "enableLabel": "Exigir cambio de contraseña periódico",
++    "maxAgeLabel": "Validez de la contraseña (días)",
++    "maxAgeHelper": "Los usuarios deben cambiar su contraseña tras estos días; 0 desactiva la política.",
++    "maxAgeError": "Introduzca un número entero de días entre 1 y {max}.",
++    "warningLabel": "Aviso antes de la caducidad (días)",
++    "warningHelper": "Días antes de la caducidad en los que la interfaz empieza a avisar al usuario.",
++    "warningError": "Introduzca un número entero de días entre 0 y {max}.",
++    "windowError": "La ventana de aviso debe ser inferior a la validez total.",
++    "disabledHelper": "Active la política de arriba para editar.",
++    "save": "Guardar",
++    "saving": "Guardando…",
++    "saved": "Política de contraseñas guardada correctamente",
++    "saveError": "Error al guardar la política de contraseñas",
++    "loadError": "Error al cargar la política de contraseñas",
++    "invalidRange": "Introduzca un número entero de días entre 1 y {max}.",
++    "note": "Cambiar o restablecer la contraseña reinicia su periodo de validez. Las cuentas existentes sin fecha de contraseña registrada no se ven afectadas hasta su próximo cambio.",
++    "expiresSoon": "Su contraseña caduca en {days} día(s). Cámbiela abajo para seguir conectado.",
++    "expiresOn": "Caduca el {date}."
+   },
+   "navigation": {
+     "dashboard": "Dashboard",
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/messages/fr.json /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/fr.json
+--- proxcenter-ui-1.5.0/frontend/src/messages/fr.json	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/fr.json	2026-11-25 13:37:58.173629234 +0000
+@@ -201,7 +201,31 @@
+     "defaultTagline": "La plateforme de gestion datacenter Proxmox",
+     "defaultHighlightMultiTenant": "vDC multi-tenants",
+     "defaultHighlightBackup": "Orchestration des sauvegardes",
+-    "defaultHighlightWhiteLabel": "White-label MSP"
++    "defaultHighlightWhiteLabel": "White-label MSP",
++    "passwordExpired": "Votre mot de passe a expiré. Demandez à un administrateur de le réinitialiser, ou connectez-vous avec un autre compte."
++  },
++  "passwordPolicy": {
++    "tabLabel": "Politique de mot de passe",
++    "title": "Expiration des mots de passe",
++    "description": "Les mots de passe locaux doivent être renouvelés après un nombre de jours fixe. Les comptes OIDC/LDAP sont gérés par leur fournisseur d'identité et ne sont pas concernés.",
++    "enableLabel": "Exiger un changement de mot de passe périodique",
++    "maxAgeLabel": "Validité du mot de passe (jours)",
++    "maxAgeHelper": "Les utilisateurs doivent changer leur mot de passe après ce nombre de jours ; 0 désactive la politique.",
++    "maxAgeError": "Saisir un nombre entier de jours entre 1 et {max}.",
++    "warningLabel": "Avertissement avant expiration (jours)",
++    "warningHelper": "Nombre de jours avant l'expiration où l'interface commence à avertir l'utilisateur.",
++    "warningError": "Saisir un nombre entier de jours entre 0 et {max}.",
++    "windowError": "La fenêtre d'avertissement doit être plus courte que la validité totale.",
++    "disabledHelper": "Activez la politique ci-dessus pour modifier.",
++    "save": "Enregistrer",
++    "saving": "Enregistrement…",
++    "saved": "Politique de mot de passe enregistrée avec succès",
++    "saveError": "Échec de l'enregistrement de la politique de mot de passe",
++    "loadError": "Échec du chargement de la politique de mot de passe",
++    "invalidRange": "Saisir un nombre entier de jours entre 1 et {max}.",
++    "note": "Un mot de passe modifié ou réinitialisé redémarre sa période de validité. Les comptes existants dont la date de mot de passe est inconnue ne sont pas affectés jusqu'au prochain changement.",
++    "expiresSoon": "Votre mot de passe expire dans {days} jour(s). Changez-le ci-dessous pour rester connecté.",
++    "expiresOn": "Expire le {date}."
+   },
+   "navigation": {
+     "dashboard": "Tableau de bord",
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/messages/ko.json /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/ko.json
+--- proxcenter-ui-1.5.0/frontend/src/messages/ko.json	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/ko.json	2026-11-25 13:37:58.224629370 +0000
+@@ -201,7 +201,31 @@
+     "defaultTagline": "Proxmox 데이터센터 관리 플랫폼",
+     "defaultHighlightMultiTenant": "멀티 테넌트 vDC",
+     "defaultHighlightBackup": "백업 오케스트레이션",
+-    "defaultHighlightWhiteLabel": "MSP 화이트 라벨"
++    "defaultHighlightWhiteLabel": "MSP 화이트 라벨",
++    "passwordExpired": "비밀번호가 만료되었습니다. 관리자에게 재설정을 요청하거나 다른 계정으로 로그인하세요."
++  },
++  "passwordPolicy": {
++    "tabLabel": "비밀번호 정책",
++    "title": "비밀번호 만료",
++    "description": "로컬 비밀번호는 지정된 일수 후 갱신해야 합니다. OIDC/LDAP 계정은 해당 ID 공급자가 관리하므로 영향을 받지 않습니다.",
++    "enableLabel": "주기적인 비밀번호 변경 요구",
++    "maxAgeLabel": "비밀번호 유효 기간(일)",
++    "maxAgeHelper": "사용자는 이 일수 후 비밀번호를 변경해야 합니다. 0이면 정책이 비활성화됩니다.",
++    "maxAgeError": "1부터 {max} 사이의 정수 일수를 입력하세요.",
++    "warningLabel": "만료 전 경고(일)",
++    "warningHelper": "만료 며칠 전부터 인터페이스에서 사용자에게 경고를 표시합니다.",
++    "warningError": "0부터 {max} 사이의 정수 일수를 입력하세요.",
++    "windowError": "경고 기간은 전체 유효 기간보다 짧아야 합니다.",
++    "disabledHelper": "편집하려면 먼저 위 정책을 활성화하세요.",
++    "save": "저장",
++    "saving": "저장 중…",
++    "saved": "비밀번호 정책이 성공적으로 저장되었습니다",
++    "saveError": "비밀번호 정책 저장 실패",
++    "loadError": "비밀번호 정책 로드 실패",
++    "invalidRange": "1부터 {max} 사이의 정수 일수를 입력하세요.",
++    "note": "비밀번호를 변경하거나 재설정하면 유효 기간이 다시 계산됩니다. 비밀번호 날짜가 기록되지 않은 기존 계정은 다음 변경 전까지 영향을 받지 않습니다.",
++    "expiresSoon": "비밀번호가 {days}일 후 만료됩니다. 계속 로그인하려면 아래에서 변경하세요.",
++    "expiresOn": "만료일: {date}."
+   },
+   "navigation": {
+     "dashboard": "대시보드",
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/messages/zh-CN.json /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/zh-CN.json
+--- proxcenter-ui-1.5.0/frontend/src/messages/zh-CN.json	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/messages/zh-CN.json	2026-11-25 13:37:58.121629095 +0000
+@@ -201,7 +201,31 @@
+     "defaultTagline": "Proxmox 数据中心管理平台",
+     "defaultHighlightMultiTenant": "多租户 vDC",
+     "defaultHighlightBackup": "备份编排",
+-    "defaultHighlightWhiteLabel": "MSP 白标"
++    "defaultHighlightWhiteLabel": "MSP 白标",
++    "passwordExpired": "您的密码已过期。请联系管理员重置，或使用其他账户登录。"
++  },
++  "passwordPolicy": {
++    "tabLabel": "密码策略",
++    "title": "密码期限",
++    "description": "强制本地密码在固定天数后更换。OIDC/LDAP 账户由其身份提供方管理，不受此策略影响。",
++    "enableLabel": "启用定期更换密码",
++    "maxAgeLabel": "密码有效期（天）",
++    "maxAgeHelper": "用户必须在此天数后更换密码；0 表示停用该策略。",
++    "maxAgeError": "请输入 1 到 {max} 之间的整数天数。",
++    "warningLabel": "到期前提醒（天）",
++    "warningHelper": "到期前多少天开始在界面中提醒用户。",
++    "warningError": "请输入 0 到 {max} 之间的整数天数。",
++    "windowError": "提醒窗口必须短于密码有效期。",
++    "disabledHelper": "先启用上方策略后才能编辑。",
++    "save": "保存",
++    "saving": "保存中…",
++    "saved": "密码策略保存成功",
++    "saveError": "保存密码策略失败",
++    "loadError": "加载密码策略失败",
++    "invalidRange": "请输入 1 到 {max} 之间的整数天数。",
++    "note": "修改或重置密码会重新计算有效期。未记录密码时间的存量账户在下次修改密码前不受影响。",
++    "expiresSoon": "您的密码将在 {days} 天内过期，请在下方及时更换。",
++    "expiresOn": "到期时间：{date}。"
+   },
+   "navigation": {
+     "dashboard": "仪表盘",
+diff -ruN '--exclude=features.patch' '--exclude=MODIFIED-FEATURES.md' proxcenter-ui-1.5.0/frontend/src/views/Login.jsx /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/views/Login.jsx
+--- proxcenter-ui-1.5.0/frontend/src/views/Login.jsx	2026-11-16 13:26:06.000000000 +0000
++++ /home/z/my-project/work/proxcenter-ui-1.5.0/frontend/src/views/Login.jsx	2026-11-25 13:37:32.044559808 +0000
+@@ -135,6 +135,10 @@
+         setTotpStep(true)
+         setTotpError('')
+         setTotpCode('')
++      } else if (result?.error === 'PASSWORD_EXPIRED') {
++        // Password expiry policy (local addition): map the authorize error
++        // code to a localised, actionable message instead of the raw code.
++        setError(t('auth.passwordExpired'))
+       } else if (result?.error) {
+         setError(result.error)
+       } else if (result?.ok) {

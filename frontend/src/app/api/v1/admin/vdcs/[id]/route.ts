@@ -1,0 +1,185 @@
+import { NextResponse } from "next/server"
+import type { Principal } from "@/lib/auth/principal"
+import { filterToTokenPerimeter } from "@/lib/api-tokens/scope"
+import { checkPermission, PERMISSIONS } from "@/lib/rbac"
+import { getVdcById, updateVdc, deleteVdc } from "@/lib/vdc"
+import { mapCreateVdcError } from "@/lib/vdc/httpErrors"
+import { audit } from "@/lib/audit"
+import { requireProviderTenant } from "@/lib/tenant"
+import { normalizeIdList } from "@/lib/templates/catalogGrants"
+import { listBindingsForVdc } from "@/lib/db/vdcPbsBindings"
+import { unbindFromVdc } from "@/lib/vdc/pbsOrchestrator"
+import { withAudit } from "@/lib/audit/withAudit"
+import { withPublicApiGuard } from "@/lib/api-tokens/routeGuard"
+
+export const runtime = "nodejs"
+
+type RouteContext = { params: Promise<{ id: string }> | { id: string }; principal?: Principal }
+
+/** The vDC, or null when it is missing or on a connection outside a token's perimeter. */
+async function findVisibleVdc(id: string, principal: Principal | undefined) {
+  const vdc = await getVdcById(id)
+  const [visible] = vdc ? await filterToTokenPerimeter([vdc], principal, v => [v.connectionId]) : []
+  return visible ?? null
+}
+
+// GET /api/v1/admin/vdcs/[id] — get vDC detail
+async function handleGet(_req: Request, ctx: RouteContext) {
+  try {
+    const params = await Promise.resolve(ctx.params)
+    const id = (params as any)?.id
+
+    if (!id) return NextResponse.json({ error: "Missing vDC ID" }, { status: 400 })
+
+    const providerGate = await requireProviderTenant()
+    if (providerGate) return providerGate
+    const denied = await checkPermission(PERMISSIONS.ADMIN_SETTINGS_VIEW)
+    if (denied) return denied
+
+    // A vDC on a connection outside a token's perimeter does not exist for it.
+    const visible = await findVisibleVdc(id, ctx.principal)
+    if (!visible) {
+      return NextResponse.json({ error: "vDC not found" }, { status: 404 })
+    }
+
+    return NextResponse.json({ data: visible })
+  } catch (e: any) {
+    return NextResponse.json({ error: e?.message || String(e) }, { status: 500 })
+  }
+}
+
+export const GET = withPublicApiGuard("admin-vdc-get", handleGet)
+
+// PUT /api/v1/admin/vdcs/[id] — update vDC
+async function handlePut(req: Request, ctx: RouteContext) {
+  try {
+    const params = await Promise.resolve(ctx.params)
+    const id = (params as any)?.id
+
+    if (!id) return NextResponse.json({ error: "Missing vDC ID" }, { status: 400 })
+
+    const providerGate = await requireProviderTenant()
+    if (providerGate) return providerGate
+    const denied = await checkPermission(PERMISSIONS.ADMIN_SETTINGS_VDCS)
+    if (denied) return denied
+    if (!(await findVisibleVdc(id, ctx.principal))) {
+      return NextResponse.json({ error: "vDC not found" }, { status: 404 })
+    }
+
+    const body = await req.json()
+
+    const vdc = await updateVdc(id, {
+      name: body.name,
+      description: body.description,
+      enabled: body.enabled,
+      nodes: body.nodes,
+      primaryStorage: typeof body.primaryStorage === 'string' && body.primaryStorage.trim()
+        ? body.primaryStorage.trim()
+        : undefined,
+      // Forward sharedBridges so the VdcTab "Shared bridges (uplinks)"
+      // checkbox actually persists. Previously dropped here, the next GET
+      // returned the old value and the UI rolled back the change.
+      sharedBridges: body.sharedBridges,
+      vlanPools: body.vlanPools,
+      storagePolicies: body.storagePolicies,
+      computePolicy: body.computePolicy,
+      allowBlankVms: typeof body.allowBlankVms === 'boolean' ? body.allowBlankVms : undefined,
+      isoLibraries: Array.isArray(body.isoLibraries) ? body.isoLibraries : undefined,
+      catalogGrants: body.catalogGrants && typeof body.catalogGrants === 'object'
+        ? { imageIds: normalizeIdList(body.catalogGrants.imageIds), blueprintIds: normalizeIdList(body.catalogGrants.blueprintIds) }
+        : undefined,
+      transport: body.transport && typeof body.transport === 'object' ? body.transport : undefined,
+      edgeModel: typeof body.edgeModel === 'string' ? body.edgeModel : undefined,
+      // Absent = unchanged, null or '' = detach, an id = attach (#1334).
+      evpnZoneId: body.evpnZoneId === undefined ? undefined : (typeof body.evpnZoneId === 'string' && body.evpnZoneId ? body.evpnZoneId : null),
+      quota: body.quota,
+    })
+
+    await audit({
+      action: "update",
+      category: "settings",
+      resourceType: "vdc",
+      resourceId: id,
+      resourceName: vdc.name,
+      details: {
+        updatedFields: Object.keys(body).filter((k) => body[k] !== undefined),
+      },
+      status: "success",
+    })
+
+    return NextResponse.json({ data: vdc })
+  } catch (e: any) {
+    const msg = e?.message || String(e)
+
+    if (msg.includes("not found")) {
+      return NextResponse.json({ error: "vDC not found" }, { status: 404 })
+    }
+
+    const mapped = mapCreateVdcError(e)
+    if (mapped.status !== 500) return NextResponse.json({ error: mapped.message }, { status: mapped.status })
+
+    return NextResponse.json({ error: msg }, { status: 500 })
+  }
+}
+
+// DELETE /api/v1/admin/vdcs/[id] — delete vDC
+async function handleDelete(_req: Request, ctx: RouteContext) {
+  try {
+    const params = await Promise.resolve(ctx.params)
+    const id = (params as any)?.id
+
+    if (!id) return NextResponse.json({ error: "Missing vDC ID" }, { status: 400 })
+
+    const providerGate = await requireProviderTenant()
+    if (providerGate) return providerGate
+    const denied = await checkPermission(PERMISSIONS.ADMIN_SETTINGS_VDCS)
+    if (denied) return denied
+
+    // Get vDC name before deletion for audit log
+    const existing = await findVisibleVdc(id, ctx.principal)
+    if (!existing) {
+      return NextResponse.json({ error: "vDC not found" }, { status: 404 })
+    }
+
+    // Cascade: unbind each PBS binding first (cleanup PVE pbs: storage + sub-token;
+    // PBS namespace + its backups are preserved on purpose, see spec §5).
+    for (const b of await listBindingsForVdc(id)) {
+      try { await unbindFromVdc(b.id) }
+      catch (e) { console.error(`[vdc-delete] pbs unbind ${b.id} failed:`, e) }
+    }
+
+    await deleteVdc(id)
+
+    await audit({
+      action: "delete",
+      category: "settings",
+      resourceType: "vdc",
+      resourceId: id,
+      resourceName: existing.name,
+      details: {
+        slug: existing.slug,
+        tenantId: existing.tenantId,
+        connectionId: existing.connectionId,
+      },
+      status: "success",
+    })
+
+    return NextResponse.json({ data: { success: true } })
+  } catch (e: any) {
+    const msg = e?.message || String(e)
+
+    if (msg.includes("not found")) {
+      return NextResponse.json({ error: "vDC not found" }, { status: 404 })
+    }
+
+    // VMs still exist in pool
+    if (msg.includes("Cannot delete vDC")) {
+      return NextResponse.json({ error: msg }, { status: 409 })
+    }
+
+    return NextResponse.json({ error: msg }, { status: 500 })
+  }
+}
+
+export const PUT = withAudit({ category: "admin", resourceType: "vdc", resourceParam: "id" }, withPublicApiGuard("admin-vdc-update", handlePut))
+export const DELETE = withAudit({ category: "admin", resourceType: "vdc", resourceParam: "id" }, withPublicApiGuard("admin-vdc-delete", handleDelete))
